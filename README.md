@@ -31,35 +31,6 @@ All metrics use the same formulas as the original Dash app:
 - **Beta**: `Cov(R_asset, R_bench) / Var(R_bench)` [pairwise dropna, ddof=1]
 - **Min observations**: `max(5, ceil(0.8 * period_days))`
 
-## Local Run (Windows PowerShell)
-
-```powershell
-cd streamlit_apps/asset-analytics
-
-# Create virtual environment
-python -m venv .venv
-
-# Activate
-.\.venv\Scripts\Activate.ps1
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the app
-python -m streamlit run app.py
-```
-
-The app will open at http://localhost:8501
-
-## Streamlit Community Cloud Deployment
-
-1. Push this folder to a GitHub repository
-2. Go to https://share.streamlit.io
-3. Connect your GitHub repo
-4. Set the main file path to `app.py`
-5. Deploy
-
-No secrets required - the app uses public data sources (yfinance, Wikipedia).
 
 ## Data Sources
 
@@ -68,8 +39,5 @@ No secrets required - the app uses public data sources (yfinance, Wikipedia).
 
 ## Notes
 
-- Initial data load may take 1-2 minutes for ~600 tickers (chunked downloads)
+- Initial data load may take 1-2 minutes for tickers (chunked downloads)
 - Data is cached for 1 hour using `@st.cache_data`
-- Two price frames are maintained:
-  - `cl_price_raw` (no forward-fill) - used for all statistics
-  - `cl_price_plot` (forward-fill limit=2) - used for charts only
