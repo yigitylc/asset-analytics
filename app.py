@@ -1,4 +1,4 @@
-
+"""
 BETA & CORRELATION ANALYTICS - Streamlit App
 
 Features:
@@ -13,7 +13,7 @@ Formulas:
 - Sharpe: mean(R - RF) / std(R - RF) * sqrt(252)
 - Beta: Cov(R_asset, R_bench) / Var(R_bench)  [pairwise dropna, ddof=1]
 - Min obs: max(5, ceil(0.8 * period_days))
-
+"""
 
 
 import streamlit as st
