@@ -103,7 +103,7 @@ BASE_TICKERS = [
     "IBIT", "BIL",
     "EFA", "VGK", "VEA", "EEM", "EUFN",
     "EWA", "EWC", "EWQ", "EWG", "EWI", "EWJ", "EWP", "EWU", "EWL",
-    "FXI", "KWEB", "CQQ","EWZ", "EWW", "EWS", "EWY", "EWT", "INDA", "EWH", "EZA",
+    "FXI", "KWEB", "CQQQ","EWZ", "EWW", "EWS", "EWY", "EWT", "INDA", "EWH", "EZA",
     "SHY", "IEI", "IEF", "TLT", "TIP", "STIP", "IGSB", "HYG", "EMB", "BNDX", "BWX", "HYEM", "IAGG",
     "DBC", "GSG", "USO", "UNG", "GLD", "SLV", "DBA",
     "VNQ", "REM",
