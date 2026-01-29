@@ -2,7 +2,6 @@
 ================================================================================
 BETA & CORRELATION ANALYTICS - Streamlit App
 ================================================================================
-Converted from Dash Quant Dashboard v3
 
 Features:
 - Beta, correlation, Sharpe, relative performance across a large asset universe
@@ -98,7 +97,7 @@ def get_min_obs(period_days: int) -> int:
 
 BASE_TICKERS = [
     "SPY", "QQQ", "DIA", "IWM",
-    "XLY", "XLP", "XLF", "XLV", "XLI", "XLB", "XLK", "XBI", "SMH", "XLC", "XLU",
+    "XLY", "XLP", "XLF", "XLV", "XLI", "XLB", "XLK", "XBI", "SMH", "IGV","XLC", "XLU",
     "XME", "GDX", "URA", "XOP", "XHB", "XLRE", "XRT",
     "IBIT", "BIL",
     "EFA", "VGK", "VEA", "EEM", "EUFN",
@@ -251,9 +250,9 @@ def build_universe() -> Tuple[List[str], Dict[str, Any]]:
     return unique, breakdown
 
 
-# =============================================================================
+
 # DATA FETCHING
-# =============================================================================
+
 
 def download_chunked(
     tickers: List[str],
@@ -371,9 +370,9 @@ def calculate_returns(prices_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFr
     return simple_returns, log_returns
 
 
-# =============================================================================
+
 # METRICS FUNCTIONS
-# =============================================================================
+
 
 def get_daily_rf(annual_rf: float, return_type: str) -> float:
     """Convert annual RF to daily."""
@@ -559,9 +558,9 @@ def calculate_rolling_sharpe(
     return rolling_sharpe
 
 
-# =============================================================================
+
 # VISUALIZATION HELPERS
-# =============================================================================
+
 
 def create_multiperiod_beta_chart(returns: pd.DataFrame, benchmark: str) -> go.Figure:
     """Create multi-period beta comparison chart."""
@@ -593,9 +592,9 @@ def create_multiperiod_beta_chart(returns: pd.DataFrame, benchmark: str) -> go.F
     return fig
 
 
-# =============================================================================
+
 # MAIN APPLICATION
-# =============================================================================
+
 
 def main():
     # -------------------------------------------------------------------------
@@ -675,9 +674,9 @@ def main():
         "Overview", "Correlation Matrix", "Beta Analysis", "Sharpe Ratios", "Relative Performance"
     ])
 
-    # =========================================================================
+    
     # TAB 1: OVERVIEW
-    # =========================================================================
+    
     with tab1:
         sharpe_all = calculate_sharpe_ratio(returns, rf_rate, period, return_type)
         betas = calculate_beta(returns, benchmark, period)
@@ -748,9 +747,9 @@ def main():
             use_container_width=True
         )
 
-    # =========================================================================
+    
     # TAB 2: CORRELATION MATRIX
-    # =========================================================================
+    
     with tab2:
         corr_matrix = calculate_correlation_matrix(returns, period)
 
@@ -792,9 +791,9 @@ def main():
             st.subheader(f"Lowest Correlation to {benchmark}")
             st.dataframe(lowest.to_frame('Correlation').style.format("{:.4f}"), use_container_width=True)
 
-    # =========================================================================
+    
     # TAB 3: BETA ANALYSIS
-    # =========================================================================
+    
     with tab3:
         betas = calculate_beta(returns, benchmark, period)
         correlations = calculate_correlation(returns, benchmark, period)
@@ -855,9 +854,9 @@ def main():
         csv = beta_corr_df.to_csv()
         st.download_button("Download Beta/Corr CSV", csv, "beta_correlation.csv", "text/csv", key="dl_beta")
 
-    # =========================================================================
+    
     # TAB 4: SHARPE RATIOS
-    # =========================================================================
+    
     with tab4:
         sharpe = calculate_sharpe_ratio(returns, rf_rate, period, return_type).dropna()
         sharpe_df = sharpe.sort_values(ascending=False).reset_index()
@@ -935,9 +934,9 @@ def main():
         csv = sharpe_df.to_csv(index=False)
         st.download_button("Download Sharpe CSV", csv, "sharpe_ratios.csv", "text/csv", key="dl_sharpe")
 
-    # =========================================================================
+    
     # TAB 5: RELATIVE PERFORMANCE
-    # =========================================================================
+    
     with tab5:
         # Use ffilled prices for plotting
         prices_period = cl_price_plot.tail(period)
