@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Streamlit/local runtime cache
+cache/
+
+# Local environment files
+.env
+.venv/
+venv/

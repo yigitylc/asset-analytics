@@ -28,11 +28,17 @@ import warnings
 import requests
 import re
 import time
+from dataclasses import dataclass, field
 from math import ceil
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any, Set
 
 warnings.filterwarnings('ignore')
+
+try:
+    from stooq_market_data_fallback import get_price_history
+except ImportError:
+    get_price_history = None
 
 # =============================================================================
 # PAGE CONFIG
@@ -65,6 +71,7 @@ class Config:
     INCLUDE_NASDAQ100 = True
 
     # Download settings
+    DATA_INTERVAL = "1d"
     MAX_RETRIES = 3
     RETRY_BASE_DELAY = 2.0
     USE_THREADING = False  # Disabled for large universes
@@ -175,8 +182,8 @@ def _read_html_with_headers(url: str) -> List[pd.DataFrame]:
     return pd.read_html(r.text)
 
 
-def fetch_sp500_constituents() -> List[str]:
-    """Fetch S&P 500 constituents with fallback."""
+def fetch_sp500_constituents() -> Tuple[List[str], Dict[str, Any]]:
+    """Fetch S&P 500 constituents with source metadata."""
     try:
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
         tables = _read_html_with_headers(url)
@@ -186,14 +193,14 @@ def fetch_sp500_constituents() -> List[str]:
                     tickers = df[col].dropna().astype(str).tolist()
                     result = [sanitize_ticker(t) for t in tickers]
                     if len(result) > 400:
-                        return result
-    except Exception:
-        pass
-    return list(SP500_FALLBACK)
+                        return result, {'source': 'wikipedia', 'error': ''}
+    except Exception as exc:
+        return list(SP500_FALLBACK), {'source': 'fallback', 'error': str(exc)}
+    return list(SP500_FALLBACK), {'source': 'fallback', 'error': 'Wikipedia table did not contain enough S&P 500 symbols.'}
 
 
-def fetch_nasdaq100_constituents() -> List[str]:
-    """Fetch Nasdaq-100 constituents with fallback."""
+def fetch_nasdaq100_constituents() -> Tuple[List[str], Dict[str, Any]]:
+    """Fetch Nasdaq-100 constituents with source metadata."""
     try:
         url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
         tables = _read_html_with_headers(url)
@@ -203,20 +210,23 @@ def fetch_nasdaq100_constituents() -> List[str]:
                     tickers = df[col].dropna().astype(str).tolist()
                     result = [sanitize_ticker(t) for t in tickers]
                     if len(result) > 90:
-                        return result
-    except Exception:
-        pass
-    return list(NASDAQ100_FALLBACK)
+                        return result, {'source': 'wikipedia', 'error': ''}
+    except Exception as exc:
+        return list(NASDAQ100_FALLBACK), {'source': 'fallback', 'error': str(exc)}
+    return list(NASDAQ100_FALLBACK), {'source': 'fallback', 'error': 'Wikipedia table did not contain enough Nasdaq-100 symbols.'}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def build_universe() -> Tuple[List[str], Dict[str, Any]]:
+def build_universe_uncached() -> Tuple[List[str], Dict[str, Any]]:
     """Build complete ticker universe."""
     breakdown = {
         'base_count': len(BASE_TICKERS),
         'adr_count': len(ADR_TICKERS),
         'sp500_count': 0,
+        'sp500_source': 'disabled',
+        'sp500_error': '',
         'nasdaq100_count': 0,
+        'nasdaq100_source': 'disabled',
+        'nasdaq100_error': '',
         'total_raw': 0,
         'duplicates_removed': 0,
         'final_unique': 0
@@ -226,14 +236,18 @@ def build_universe() -> Tuple[List[str], Dict[str, Any]]:
     universe.extend(ADR_TICKERS)
 
     if Config.INCLUDE_SP500:
-        sp500 = fetch_sp500_constituents()
+        sp500, sp500_meta = fetch_sp500_constituents()
         universe.extend(sp500)
         breakdown['sp500_count'] = len(sp500)
+        breakdown['sp500_source'] = sp500_meta.get('source', 'unknown')
+        breakdown['sp500_error'] = sp500_meta.get('error', '')
 
     if Config.INCLUDE_NASDAQ100:
-        ndx = fetch_nasdaq100_constituents()
+        ndx, ndx_meta = fetch_nasdaq100_constituents()
         universe.extend(ndx)
         breakdown['nasdaq100_count'] = len(ndx)
+        breakdown['nasdaq100_source'] = ndx_meta.get('source', 'unknown')
+        breakdown['nasdaq100_error'] = ndx_meta.get('error', '')
 
     breakdown['total_raw'] = len(universe)
 
@@ -248,8 +262,156 @@ def build_universe() -> Tuple[List[str], Dict[str, Any]]:
     return unique, breakdown
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_universe() -> Tuple[List[str], Dict[str, Any]]:
+    """Build complete ticker universe with Streamlit caching."""
+    return build_universe_uncached()
+
+
 
 # DATA FETCHING
+
+
+@dataclass
+class YahooDownloadResult:
+    """Structured result for Yahoo's primary adjusted-close fetch."""
+    data: pd.DataFrame
+    requested_tickers: List[str] = field(default_factory=list)
+    loaded_tickers: List[str] = field(default_factory=list)
+    missing_tickers: List[str] = field(default_factory=list)
+    all_nan_tickers: List[str] = field(default_factory=list)
+    retried_tickers: List[str] = field(default_factory=list)
+    recovered_tickers: List[str] = field(default_factory=list)
+    failed_tickers: List[str] = field(default_factory=list)
+    error_by_ticker: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class StooqRecoveryResult:
+    """Structured result for daily Stooq close recovery."""
+    data: pd.DataFrame
+    metadata_by_ticker: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    recovered_tickers: List[str] = field(default_factory=list)
+    failed_tickers: List[str] = field(default_factory=list)
+    error_by_ticker: Dict[str, str] = field(default_factory=dict)
+
+
+def _ticker_key(ticker: str) -> str:
+    """Normalize symbols for comparing requested and returned columns."""
+    return sanitize_ticker(str(ticker)).upper()
+
+
+def _ordered_unique(seq: List[str]) -> List[str]:
+    """Deduplicate symbols while preserving order."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in seq:
+        key = _ticker_key(item)
+        if key not in seen:
+            seen.add(key)
+            out.append(str(item).upper())
+    return out
+
+
+def format_price_basis_label(price_basis: str) -> str:
+    """Human-readable label for mixed data-source diagnostics."""
+    labels = {
+        'yfinance_adjusted_close': 'Yahoo adjusted close',
+        'stooq_close': 'Stooq daily close (not Yahoo adjusted close)',
+    }
+    return labels.get(price_basis, price_basis)
+
+
+def _retry_delay(attempt: int) -> None:
+    if attempt > 0:
+        delay = Config.RETRY_BASE_DELAY * (2 ** (attempt - 1))
+        time.sleep(delay)
+
+
+def _extract_close_frame(data: pd.DataFrame, requested: List[str]) -> pd.DataFrame:
+    """Extract Yahoo close columns from either single or multi-ticker frames."""
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    if isinstance(data.columns, pd.MultiIndex):
+        if 'Close' not in data.columns.get_level_values(0):
+            return pd.DataFrame()
+        close = data['Close']
+    else:
+        if 'Close' not in data.columns:
+            return pd.DataFrame()
+        close = data[['Close']]
+        if len(requested) == 1:
+            close.columns = [requested[0]]
+
+    if isinstance(close, pd.Series):
+        close = close.to_frame(name=requested[0] if requested else close.name)
+
+    close = close.copy()
+    close.columns = [sanitize_ticker(str(col)).upper() for col in close.columns]
+    return close
+
+
+def _align_close_frame(close: pd.DataFrame, requested: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+    """Return close columns in requested ticker order and list missing symbols."""
+    if close.empty:
+        return pd.DataFrame(index=close.index), list(requested)
+
+    col_by_key = {_ticker_key(col): col for col in close.columns}
+    aligned: Dict[str, pd.Series] = {}
+    missing: List[str] = []
+
+    for ticker in requested:
+        key = _ticker_key(ticker)
+        if key in col_by_key:
+            aligned[ticker] = pd.to_numeric(close[col_by_key[key]], errors='coerce')
+        else:
+            missing.append(ticker)
+
+    if not aligned:
+        return pd.DataFrame(index=close.index), missing
+    return pd.DataFrame(aligned), missing
+
+
+def _download_yahoo_request(
+    tickers: List[str],
+    start: dt.datetime,
+    end: dt.datetime,
+) -> Tuple[pd.DataFrame, List[str], List[str], str]:
+    """Download one Yahoo request with retries and explicit missing detection."""
+    last_error = ""
+
+    for attempt in range(Config.MAX_RETRIES):
+        try:
+            _retry_delay(attempt)
+            data = yf.download(
+                tickers,
+                start=start,
+                end=end,
+                auto_adjust=True,
+                progress=False,
+                threads=Config.USE_THREADING
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+        close = _extract_close_frame(data, tickers)
+        aligned, missing = _align_close_frame(close, tickers)
+        all_nan = [col for col in aligned.columns if aligned[col].isna().all()]
+        valid = aligned.drop(columns=all_nan, errors='ignore')
+        still_missing = _ordered_unique(missing + all_nan)
+
+        if valid.empty and attempt < Config.MAX_RETRIES - 1:
+            last_error = "Yahoo returned an empty or all-NaN response."
+            continue
+
+        if valid.empty:
+            return pd.DataFrame(), list(tickers), all_nan, last_error or "Yahoo returned no usable close data."
+
+        return valid, still_missing, all_nan, ""
+
+    return pd.DataFrame(), list(tickers), [], last_error or "Yahoo download failed."
 
 
 def download_chunked(
@@ -258,71 +420,148 @@ def download_chunked(
     end: dt.datetime,
     chunk_size: int = 50,
     progress_bar=None
-) -> Tuple[pd.DataFrame, List[str]]:
-    """Download price data in chunks with retry."""
-    all_data = []
-    failed_tickers: List[str] = []
+) -> YahooDownloadResult:
+    """Download Yahoo adjusted close in chunks, then retry missing symbols singly."""
+    all_data: List[pd.DataFrame] = []
+    initial_missing: List[str] = []
+    all_nan_tickers: List[str] = []
+    error_by_ticker: Dict[str, str] = {}
     total_chunks = (len(tickers) + chunk_size - 1) // chunk_size
 
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i:i + chunk_size]
         chunk_num = i // chunk_size + 1
-        chunk_success = False
 
         if progress_bar:
             progress_bar.progress(chunk_num / total_chunks, f"Downloading chunk {chunk_num}/{total_chunks}...")
 
-        for attempt in range(Config.MAX_RETRIES):
-            try:
-                if attempt > 0:
-                    delay = Config.RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    time.sleep(delay)
+        close, missing, all_nan, error = _download_yahoo_request(chunk, start, end)
+        if not close.empty:
+            all_data.append(close)
+        initial_missing.extend(missing)
+        all_nan_tickers.extend(all_nan)
+        if error:
+            for ticker in missing:
+                error_by_ticker[ticker] = error
 
-                data = yf.download(
-                    chunk,
-                    start=start,
-                    end=end,
-                    auto_adjust=True,
-                    progress=False,
-                    threads=Config.USE_THREADING
-                )
+    retry_tickers = _ordered_unique(initial_missing)
+    retry_data: List[pd.DataFrame] = []
+    recovered_tickers: List[str] = []
+    final_failed: List[str] = []
 
-                if data.empty:
-                    failed_tickers.extend(chunk)
-                    chunk_success = True
-                    break
+    for ticker in retry_tickers:
+        close, missing, all_nan, error = _download_yahoo_request([ticker], start, end)
+        all_nan_tickers.extend(all_nan)
+        if not close.empty and ticker in close.columns:
+            retry_data.append(close[[ticker]])
+            recovered_tickers.append(ticker)
+            error_by_ticker.pop(ticker, None)
+        else:
+            final_failed.append(ticker)
+            error_by_ticker[ticker] = error or "Yahoo returned no usable close data."
 
-                if isinstance(data.columns, pd.MultiIndex):
-                    close = data['Close']
-                else:
-                    close = data[['Close']]
-                    close.columns = chunk[:1]
-
-                all_data.append(close)
-                chunk_success = True
-                break
-
-            except Exception:
-                if attempt == Config.MAX_RETRIES - 1:
-                    failed_tickers.extend(chunk)
-
-        if not chunk_success:
-            pass
-
-    if not all_data:
-        return pd.DataFrame(), failed_tickers
-
-    combined = pd.concat(all_data, axis=1)
-
-    if combined.index.tz is not None:
+    frames = all_data + retry_data
+    combined = pd.concat(frames, axis=1) if frames else pd.DataFrame()
+    if not combined.empty:
+        combined = combined.loc[:, ~combined.columns.duplicated()]
+        combined = combined.sort_index()
+    if hasattr(combined.index, 'tz') and combined.index.tz is not None:
         combined.index = combined.index.tz_localize(None)
-    combined = combined.sort_index()
 
-    return combined, failed_tickers
+    loaded_tickers = list(combined.columns)
+    return YahooDownloadResult(
+        data=combined,
+        requested_tickers=list(tickers),
+        loaded_tickers=loaded_tickers,
+        missing_tickers=retry_tickers,
+        all_nan_tickers=_ordered_unique(all_nan_tickers),
+        retried_tickers=retry_tickers,
+        recovered_tickers=recovered_tickers,
+        failed_tickers=_ordered_unique(final_failed),
+        error_by_ticker=error_by_ticker,
+    )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+def recover_missing_with_stooq(
+    missing_tickers: List[str],
+    start: dt.datetime,
+    end: dt.datetime,
+    interval: str = Config.DATA_INTERVAL,
+) -> StooqRecoveryResult:
+    """Recover residual missing symbols with Stooq daily close only."""
+    if not missing_tickers:
+        return StooqRecoveryResult(data=pd.DataFrame())
+
+    if interval != "1d":
+        return StooqRecoveryResult(
+            data=pd.DataFrame(),
+            failed_tickers=list(missing_tickers),
+            error_by_ticker={ticker: "Stooq fallback supports daily data only." for ticker in missing_tickers},
+        )
+
+    if get_price_history is None:
+        return StooqRecoveryResult(
+            data=pd.DataFrame(),
+            failed_tickers=list(missing_tickers),
+            error_by_ticker={ticker: "stooq-market-data-fallback is not installed." for ticker in missing_tickers},
+        )
+
+    recovered_frames: List[pd.DataFrame] = []
+    metadata_by_ticker: Dict[str, Dict[str, Any]] = {}
+    recovered_tickers: List[str] = []
+    failed_tickers: List[str] = []
+    error_by_ticker: Dict[str, str] = {}
+    start_s = start.strftime('%Y-%m-%d')
+    end_s = end.strftime('%Y-%m-%d')
+
+    for ticker in missing_tickers:
+        try:
+            history = get_price_history(
+                ticker,
+                start=start_s,
+                end=end_s,
+                interval="1d",
+                preferred_provider="stooq",
+                fallback=False,
+            )
+            data = history.data
+            close_col = 'close' if 'close' in data.columns else 'Close' if 'Close' in data.columns else None
+            if close_col is None:
+                raise ValueError("Stooq response did not include a close column.")
+
+            series = pd.to_numeric(data[close_col], errors='coerce').rename(ticker)
+            series = series.dropna()
+            if series.empty:
+                raise ValueError("Stooq returned no usable close data.")
+            if hasattr(series.index, 'tz') and series.index.tz is not None:
+                series.index = series.index.tz_localize(None)
+
+            recovered_frames.append(series.to_frame())
+            recovered_tickers.append(ticker)
+            metadata_by_ticker[ticker] = {
+                'provider': getattr(history, 'provider', 'stooq'),
+                'provider_symbol': getattr(history, 'provider_symbol', ticker),
+                'price_basis': getattr(history, 'price_basis', 'stooq_close'),
+                'data_source': 'Stooq daily close',
+            }
+        except Exception as exc:
+            failed_tickers.append(ticker)
+            error_by_ticker[ticker] = str(exc)
+
+    recovered = pd.concat(recovered_frames, axis=1).sort_index() if recovered_frames else pd.DataFrame()
+    return StooqRecoveryResult(
+        data=recovered,
+        metadata_by_ticker=metadata_by_ticker,
+        recovered_tickers=recovered_tickers,
+        failed_tickers=failed_tickers,
+        error_by_ticker=error_by_ticker,
+    )
+
+
+def fetch_price_data_uncached(
+    tickers: List[str],
+    interval: str = Config.DATA_INTERVAL,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """
     Fetch price data and return two frames.
     cl_price_raw (no fill) for stats, cl_price_plot (ffill) for charts.
@@ -330,34 +569,110 @@ def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame, Di
     end = dt.datetime.today()
     start = end - dt.timedelta(days=365 * Config.YEARS_OF_DATA)
 
-    raw_data, failed_tickers = download_chunked(tickers, start, end, Config.CHUNK_SIZE)
+    yahoo_result = download_chunked(tickers, start, end, Config.CHUNK_SIZE)
+    raw_data = yahoo_result.data
+    stooq_result = recover_missing_with_stooq(yahoo_result.failed_tickers, start, end, interval)
 
-    if raw_data.empty:
-        return pd.DataFrame(), pd.DataFrame(), {'final_ticker_count': 0}
+    if not stooq_result.data.empty:
+        raw_data = pd.concat([raw_data, stooq_result.data], axis=1) if not raw_data.empty else stooq_result.data.copy()
+        raw_data = raw_data.loc[:, ~raw_data.columns.duplicated()]
 
-    # Drop all-NaN columns and rows
+    all_nan_after_recovery = list(raw_data.columns[raw_data.isna().all()]) if not raw_data.empty else []
     raw_data = raw_data.dropna(how='all', axis=1)
     raw_data = raw_data.dropna(how='all', axis=0)
 
-    # Two price frames
+    final_columns = list(raw_data.columns)
+    provider_by_ticker = {ticker: 'yfinance' for ticker in yahoo_result.loaded_tickers if ticker in final_columns}
+    provider_symbol_by_ticker = {ticker: ticker for ticker in yahoo_result.loaded_tickers if ticker in final_columns}
+    price_basis_by_ticker = {ticker: 'yfinance_adjusted_close' for ticker in yahoo_result.loaded_tickers if ticker in final_columns}
+    data_source_by_ticker = {ticker: 'Yahoo adjusted close' for ticker in yahoo_result.loaded_tickers if ticker in final_columns}
+
+    for ticker, meta in stooq_result.metadata_by_ticker.items():
+        if ticker in final_columns:
+            provider_by_ticker[ticker] = meta.get('provider', 'stooq')
+            provider_symbol_by_ticker[ticker] = meta.get('provider_symbol', ticker)
+            price_basis_by_ticker[ticker] = meta.get('price_basis', 'stooq_close')
+            data_source_by_ticker[ticker] = meta.get('data_source', 'Stooq daily close')
+
+    final_failed = [
+        ticker for ticker in _ordered_unique(stooq_result.failed_tickers + all_nan_after_recovery)
+        if ticker not in final_columns
+    ]
+
+    source_breakdown = {
+        'Yahoo adjusted close': sum(1 for source in data_source_by_ticker.values() if source == 'Yahoo adjusted close'),
+        'Stooq daily close': sum(1 for source in data_source_by_ticker.values() if source == 'Stooq daily close'),
+    }
+
+    if raw_data.empty:
+        fetch_stats = {
+            'pre_fetch_universe_count': len(tickers),
+            'yahoo_loaded_count': 0,
+            'yahoo_missing_count': len(yahoo_result.missing_tickers),
+            'yahoo_retried_count': len(yahoo_result.retried_tickers),
+            'yahoo_recovered_count': len(yahoo_result.recovered_tickers),
+            'yahoo_failed_count': len(yahoo_result.failed_tickers),
+            'yahoo_all_nan_count': len(yahoo_result.all_nan_tickers),
+            'stooq_recovered_count': 0,
+            'stooq_failed_count': len(stooq_result.failed_tickers),
+            'failed_unavailable_count': len(final_failed),
+            'final_ticker_count': 0,
+            'final_failed_tickers': final_failed,
+            'trading_days': 0,
+            'data_completeness_pct': 0,
+            'date_start': 'N/A',
+            'date_end': 'N/A',
+        }
+        return pd.DataFrame(), pd.DataFrame(), fetch_stats
+
     cl_price_raw = raw_data.copy()
     cl_price_plot = raw_data.ffill(limit=Config.MAX_FFILL_DAYS)
 
-    # Stats
     total_cells = cl_price_raw.shape[0] * cl_price_raw.shape[1]
     nan_cells = cl_price_raw.isna().sum().sum()
     completeness = (1 - nan_cells / total_cells) * 100 if total_cells > 0 else 0
 
     fetch_stats = {
         'pre_fetch_universe_count': len(tickers),
+        'yahoo_loaded_count': len([t for t in yahoo_result.loaded_tickers if t in final_columns]),
+        'yahoo_missing_count': len(yahoo_result.missing_tickers),
+        'yahoo_retried_count': len(yahoo_result.retried_tickers),
+        'yahoo_recovered_count': len(yahoo_result.recovered_tickers),
+        'yahoo_failed_count': len(yahoo_result.failed_tickers),
+        'yahoo_all_nan_count': len(yahoo_result.all_nan_tickers),
+        'yahoo_loaded_tickers': [t for t in yahoo_result.loaded_tickers if t in final_columns],
+        'yahoo_missing_tickers': yahoo_result.missing_tickers,
+        'yahoo_retried_tickers': yahoo_result.retried_tickers,
+        'yahoo_recovered_tickers': yahoo_result.recovered_tickers,
+        'yahoo_failed_tickers': yahoo_result.failed_tickers,
+        'yahoo_all_nan_tickers': yahoo_result.all_nan_tickers,
+        'stooq_recovered_count': len(stooq_result.recovered_tickers),
+        'stooq_failed_count': len(stooq_result.failed_tickers),
+        'stooq_recovered_tickers': stooq_result.recovered_tickers,
+        'stooq_failed_tickers': stooq_result.failed_tickers,
+        'failed_unavailable_count': len(final_failed),
+        'final_failed_tickers': final_failed,
         'final_ticker_count': len(cl_price_raw.columns),
         'trading_days': len(cl_price_raw),
         'data_completeness_pct': completeness,
         'date_start': cl_price_raw.index[0].strftime('%Y-%m-%d') if len(cl_price_raw) > 0 else 'N/A',
         'date_end': cl_price_raw.index[-1].strftime('%Y-%m-%d') if len(cl_price_raw) > 0 else 'N/A',
+        'provider_by_ticker': provider_by_ticker,
+        'provider_symbol_by_ticker': provider_symbol_by_ticker,
+        'price_basis_by_ticker': price_basis_by_ticker,
+        'data_source_by_ticker': data_source_by_ticker,
+        'data_source_breakdown': source_breakdown,
+        'yahoo_error_by_ticker': yahoo_result.error_by_ticker,
+        'stooq_error_by_ticker': stooq_result.error_by_ticker,
     }
 
     return cl_price_raw, cl_price_plot, fetch_stats
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Fetch price data with Streamlit caching."""
+    return fetch_price_data_uncached(tickers, Config.DATA_INTERVAL)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -645,6 +960,15 @@ def main():
 
     available_tickers = list(cl_price_raw.columns)
 
+    if (
+        universe_breakdown.get('sp500_source') == 'fallback'
+        or universe_breakdown.get('nasdaq100_source') == 'fallback'
+    ):
+        st.warning("Wikipedia index fetch used a reduced fallback list. The universe may be smaller than the full S&P 500 + Nasdaq-100 set.")
+
+    if fetch_stats.get('stooq_recovered_count', 0) > 0:
+        st.warning("Some symbols use Stooq daily close fallback. This is not Yahoo adjusted close.")
+
     # Benchmark selector (in sidebar, after data is loaded)
     benchmark_options = ['SPY', 'QQQ', 'IWM', 'DIA', 'EFA', 'EEM']
     benchmark_options = [b for b in benchmark_options if b in available_tickers]
@@ -656,10 +980,40 @@ def main():
     # Data info
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Universe Info**")
-    st.sidebar.caption(f"Tickers loaded: {fetch_stats['final_ticker_count']}")
+    st.sidebar.caption(f"Raw universe: {universe_breakdown.get('total_raw', 0)}")
+    st.sidebar.caption(f"Final unique universe: {universe_breakdown.get('final_unique', 0)}")
+    st.sidebar.caption(
+        f"S&P 500: {universe_breakdown.get('sp500_count', 0)} "
+        f"({universe_breakdown.get('sp500_source', 'unknown')})"
+    )
+    st.sidebar.caption(
+        f"Nasdaq-100: {universe_breakdown.get('nasdaq100_count', 0)} "
+        f"({universe_breakdown.get('nasdaq100_source', 'unknown')})"
+    )
+    st.sidebar.caption(f"Final loaded: {fetch_stats['final_ticker_count']}")
     st.sidebar.caption(f"Trading days: {fetch_stats['trading_days']}")
     st.sidebar.caption(f"Date range: {fetch_stats['date_start']} to {fetch_stats['date_end']}")
     st.sidebar.caption(f"Completeness: {fetch_stats['data_completeness_pct']:.1f}%")
+
+    source_breakdown = fetch_stats.get('data_source_breakdown', {})
+    with st.sidebar.expander("Data diagnostics", expanded=False):
+        st.caption(f"Base tickers: {universe_breakdown.get('base_count', 0)}")
+        st.caption(f"ADR tickers: {universe_breakdown.get('adr_count', 0)}")
+        st.caption(f"Duplicates removed: {universe_breakdown.get('duplicates_removed', 0)}")
+        st.caption(f"Excluded tickers: {universe_breakdown.get('excluded_count', 0)}")
+        st.caption(f"Yahoo loaded: {fetch_stats.get('yahoo_loaded_count', 0)}")
+        st.caption(f"Yahoo initial missing/retried: {fetch_stats.get('yahoo_missing_count', 0)}")
+        st.caption(f"Yahoo recovered on retry: {fetch_stats.get('yahoo_recovered_count', 0)}")
+        st.caption(f"Yahoo failed/missing: {fetch_stats.get('yahoo_failed_count', 0)}")
+        st.caption(f"Yahoo all-NaN dropped: {fetch_stats.get('yahoo_all_nan_count', 0)}")
+        st.caption(f"Stooq recovered: {fetch_stats.get('stooq_recovered_count', 0)}")
+        st.caption(f"Failed/unavailable: {fetch_stats.get('failed_unavailable_count', 0)}")
+        st.caption(f"{format_price_basis_label('yfinance_adjusted_close')}: {source_breakdown.get('Yahoo adjusted close', 0)}")
+        st.caption(f"{format_price_basis_label('stooq_close')}: {source_breakdown.get('Stooq daily close', 0)}")
+
+        failed = fetch_stats.get('final_failed_tickers', [])
+        if failed:
+            st.caption("Failed sample: " + ", ".join(failed[:50]))
 
     # Select returns based on type
     returns = log_returns if return_type == 'log' else simple_returns
