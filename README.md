@@ -31,8 +31,4 @@ The dashboard keeps Yahoo adjusted close as the preferred research basis. If Sto
 
 The sidebar reports raw universe size, final unique universe size, Wikipedia/static/emergency constituent sources, Yahoo loaded and failed counts, Stooq recovered counts, final loaded count, and unavailable tickers. Detailed failed ticker samples are kept inside an expander.
 
-## Notes
 
-- Initial data load may take 1-2 minutes for ~600 tickers (chunked downloads)
-- Data is cached for 1 hour using `@st.cache_data`
-- Stooq fallback is daily-close oriented only; it is not a replacement for Yahoo dividends, splits, options, fundamentals, metadata, or intraday data
