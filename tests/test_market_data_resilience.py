@@ -27,7 +27,13 @@ def requested_list(tickers):
     return list(tickers) if isinstance(tickers, (list, tuple)) else [tickers]
 
 
-def test_wikipedia_success_and_failure_source_diagnostics(monkeypatch):
+def write_static_csv(path, prefix, count):
+    symbols = [f"{prefix}{i:03d}" for i in range(count)]
+    pd.DataFrame({"symbol": symbols, "source": "test"}).to_csv(path, index=False)
+    return symbols
+
+
+def test_wikipedia_success_source_diagnostics(monkeypatch):
     sp500_df = pd.DataFrame({"Symbol": [f"T{i}" for i in range(401)]})
     nasdaq_df = pd.DataFrame({"Ticker": [f"N{i}" for i in range(91)]})
 
@@ -41,14 +47,51 @@ def test_wikipedia_success_and_failure_source_diagnostics(monkeypatch):
     assert len(tickers) == 91
     assert meta["source"] == "wikipedia"
 
+
+def test_wikipedia_failure_uses_static_csv_source(monkeypatch, tmp_path):
+    sp500_csv = tmp_path / "sp500_constituents.csv"
+    nasdaq_csv = tmp_path / "nasdaq100_constituents.csv"
+    sp500_symbols = write_static_csv(sp500_csv, "SP", 401)
+    nasdaq_symbols = write_static_csv(nasdaq_csv, "ND", 91)
+
     def raise_fetch(_url):
         raise RuntimeError("blocked")
 
     monkeypatch.setattr(app, "_read_html_with_headers", raise_fetch)
+    monkeypatch.setattr(app, "SP500_STATIC_CSV", sp500_csv)
+    monkeypatch.setattr(app, "NASDAQ100_STATIC_CSV", nasdaq_csv)
+
+    tickers, meta = app.fetch_sp500_constituents()
+    assert tickers == sp500_symbols
+    assert meta["source"] == "static_csv"
+    assert "blocked" in meta["error"]
+
+    tickers, meta = app.fetch_nasdaq100_constituents()
+    assert tickers == nasdaq_symbols
+    assert meta["source"] == "static_csv"
+    assert "blocked" in meta["error"]
+
+
+def test_missing_or_broken_static_csv_uses_emergency_fallback(monkeypatch, tmp_path):
+    broken_csv = tmp_path / "broken_sp500.csv"
+    pd.DataFrame({"ticker": ["AAA"]}).to_csv(broken_csv, index=False)
+
+    def raise_fetch(_url):
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(app, "_read_html_with_headers", raise_fetch)
+    monkeypatch.setattr(app, "SP500_STATIC_CSV", broken_csv)
+    monkeypatch.setattr(app, "NASDAQ100_STATIC_CSV", tmp_path / "missing_nasdaq.csv")
+
     tickers, meta = app.fetch_sp500_constituents()
     assert tickers == app.SP500_FALLBACK
-    assert meta["source"] == "fallback"
-    assert "blocked" in meta["error"]
+    assert meta["source"] == "emergency_fallback"
+    assert "static CSV failed" in meta["error"]
+
+    tickers, meta = app.fetch_nasdaq100_constituents()
+    assert tickers == app.NASDAQ100_FALLBACK
+    assert meta["source"] == "emergency_fallback"
+    assert "static CSV failed" in meta["error"]
 
 
 def test_build_universe_preserves_counts_and_sources(monkeypatch):
@@ -63,7 +106,7 @@ def test_build_universe_preserves_counts_and_sources(monkeypatch):
     monkeypatch.setattr(
         app,
         "fetch_nasdaq100_constituents",
-        lambda: (["EEE"], {"source": "fallback", "error": "test"}),
+        lambda: (["EEE"], {"source": "static_csv", "error": "test"}),
     )
 
     tickers, breakdown = app.build_universe_uncached()
@@ -74,11 +117,45 @@ def test_build_universe_preserves_counts_and_sources(monkeypatch):
     assert breakdown["sp500_count"] == 2
     assert breakdown["sp500_source"] == "wikipedia"
     assert breakdown["nasdaq100_count"] == 1
-    assert breakdown["nasdaq100_source"] == "fallback"
+    assert breakdown["nasdaq100_source"] == "static_csv"
     assert breakdown["total_raw"] == 7
     assert breakdown["duplicates_removed"] == 2
     assert breakdown["excluded_count"] == 1
     assert breakdown["final_unique"] == 4
+
+
+def test_build_universe_uses_full_static_csvs_when_live_fetch_fails(monkeypatch, tmp_path):
+    sp500_csv = tmp_path / "sp500_constituents.csv"
+    nasdaq_csv = tmp_path / "nasdaq100_constituents.csv"
+    write_static_csv(sp500_csv, "SP", 401)
+    write_static_csv(nasdaq_csv, "ND", 91)
+
+    def raise_fetch(_url):
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(app, "_read_html_with_headers", raise_fetch)
+    monkeypatch.setattr(app, "SP500_STATIC_CSV", sp500_csv)
+    monkeypatch.setattr(app, "NASDAQ100_STATIC_CSV", nasdaq_csv)
+    monkeypatch.setattr(app, "BASE_TICKERS", ["SPY", "QQQ"])
+    monkeypatch.setattr(app, "ADR_TICKERS", ["TSM", "ASML"])
+    monkeypatch.setattr(app.Config, "EXCLUDED_TICKERS", set())
+
+    tickers, breakdown = app.build_universe_uncached()
+
+    assert "SPY" in tickers
+    assert "QQQ" in tickers
+    assert "TSM" in tickers
+    assert "ASML" in tickers
+    assert breakdown["sp500_source"] == "static_csv"
+    assert breakdown["nasdaq100_source"] == "static_csv"
+    assert breakdown["sp500_count"] == 401
+    assert breakdown["nasdaq100_count"] == 91
+    assert breakdown["final_unique"] == 496
+
+
+def test_dot_to_dash_mapping_still_works():
+    assert app.sanitize_ticker("BRK.B") == "BRK-B"
+    assert app.sanitize_ticker("PBR.A") == "PBR-A"
 
 
 def test_partial_yfinance_chunk_detects_missing_tickers(monkeypatch):

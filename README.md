@@ -21,7 +21,7 @@ A comprehensive asset analytics dashboard for analyzing beta, correlation, Sharp
 
 ## Data Sources
 
-- **S&P 500 / Nasdaq-100 Constituents**: Wikipedia (with fallback to hardcoded lists)
+- **S&P 500 / Nasdaq-100 Constituents**: Wikipedia first, committed static CSVs when live Wikipedia is unavailable, and small emergency lists only if both fail
 - **Primary Market Data**: yfinance / Yahoo Finance adjusted close
 - **Fallback Market Data**: Stooq daily close through `stooq-market-data-fallback`, used only for symbols still missing after Yahoo retries
 
@@ -29,7 +29,7 @@ The dashboard keeps Yahoo adjusted close as the preferred research basis. If Sto
 
 ## Data Diagnostics
 
-The sidebar reports raw universe size, final unique universe size, Wikipedia vs fallback constituent sources, Yahoo loaded and failed counts, Stooq recovered counts, final loaded count, and unavailable tickers. Detailed failed ticker samples are kept inside an expander.
+The sidebar reports raw universe size, final unique universe size, Wikipedia/static/emergency constituent sources, Yahoo loaded and failed counts, Stooq recovered counts, final loaded count, and unavailable tickers. Detailed failed ticker samples are kept inside an expander.
 
 ## Notes
 
