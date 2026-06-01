@@ -29,6 +29,7 @@ import requests
 import re
 import time
 from dataclasses import dataclass, field
+from io import StringIO
 from math import ceil
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any, Set
@@ -132,6 +133,10 @@ DOT_TO_DASH = {
     "PBR.A": "PBR-A", "EBR.B": "EBR-B",
 }
 
+STATIC_UNIVERSE_DIR = Path(__file__).resolve().parent / "data" / "universe"
+SP500_STATIC_CSV = STATIC_UNIVERSE_DIR / "sp500_constituents.csv"
+NASDAQ100_STATIC_CSV = STATIC_UNIVERSE_DIR / "nasdaq100_constituents.csv"
+
 SP500_FALLBACK = [
     "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "GOOG", "META", "TSLA", "BRK-B", "UNH",
     "XOM", "JNJ", "JPM", "V", "PG", "MA", "HD", "CVX", "MRK", "ABBV", "LLY", "PEP",
@@ -179,11 +184,26 @@ def _read_html_with_headers(url: str) -> List[pd.DataFrame]:
     }
     r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
-    return pd.read_html(r.text)
+    return pd.read_html(StringIO(r.text))
+
+
+def _load_static_universe_csv(path: Path, min_count: int) -> List[str]:
+    """Load a committed static constituent list."""
+    df = pd.read_csv(path)
+    if 'symbol' not in df.columns:
+        raise ValueError(f"{path} is missing a symbol column.")
+
+    tickers = [sanitize_ticker(t) for t in df['symbol'].dropna().astype(str).tolist()]
+    tickers = [ticker for ticker in tickers if ticker]
+    tickers = unique_order(tickers)
+    if len(tickers) < min_count:
+        raise ValueError(f"{path} has only {len(tickers)} symbols; expected at least {min_count}.")
+    return tickers
 
 
 def fetch_sp500_constituents() -> Tuple[List[str], Dict[str, Any]]:
     """Fetch S&P 500 constituents with source metadata."""
+    live_error = ""
     try:
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
         tables = _read_html_with_headers(url)
@@ -195,12 +215,25 @@ def fetch_sp500_constituents() -> Tuple[List[str], Dict[str, Any]]:
                     if len(result) > 400:
                         return result, {'source': 'wikipedia', 'error': ''}
     except Exception as exc:
-        return list(SP500_FALLBACK), {'source': 'fallback', 'error': str(exc)}
-    return list(SP500_FALLBACK), {'source': 'fallback', 'error': 'Wikipedia table did not contain enough S&P 500 symbols.'}
+        live_error = str(exc)
+    if not live_error:
+        live_error = 'Wikipedia table did not contain enough S&P 500 symbols.'
+
+    try:
+        return _load_static_universe_csv(SP500_STATIC_CSV, 400), {
+            'source': 'static_csv',
+            'error': live_error,
+        }
+    except Exception as static_exc:
+        return list(SP500_FALLBACK), {
+            'source': 'emergency_fallback',
+            'error': f"{live_error}; static CSV failed: {static_exc}",
+        }
 
 
 def fetch_nasdaq100_constituents() -> Tuple[List[str], Dict[str, Any]]:
     """Fetch Nasdaq-100 constituents with source metadata."""
+    live_error = ""
     try:
         url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
         tables = _read_html_with_headers(url)
@@ -212,8 +245,20 @@ def fetch_nasdaq100_constituents() -> Tuple[List[str], Dict[str, Any]]:
                     if len(result) > 90:
                         return result, {'source': 'wikipedia', 'error': ''}
     except Exception as exc:
-        return list(NASDAQ100_FALLBACK), {'source': 'fallback', 'error': str(exc)}
-    return list(NASDAQ100_FALLBACK), {'source': 'fallback', 'error': 'Wikipedia table did not contain enough Nasdaq-100 symbols.'}
+        live_error = str(exc)
+    if not live_error:
+        live_error = 'Wikipedia table did not contain enough Nasdaq-100 symbols.'
+
+    try:
+        return _load_static_universe_csv(NASDAQ100_STATIC_CSV, 90), {
+            'source': 'static_csv',
+            'error': live_error,
+        }
+    except Exception as static_exc:
+        return list(NASDAQ100_FALLBACK), {
+            'source': 'emergency_fallback',
+            'error': f"{live_error}; static CSV failed: {static_exc}",
+        }
 
 
 def build_universe_uncached() -> Tuple[List[str], Dict[str, Any]]:
@@ -961,10 +1006,16 @@ def main():
     available_tickers = list(cl_price_raw.columns)
 
     if (
-        universe_breakdown.get('sp500_source') == 'fallback'
-        or universe_breakdown.get('nasdaq100_source') == 'fallback'
+        universe_breakdown.get('sp500_source') == 'static_csv'
+        or universe_breakdown.get('nasdaq100_source') == 'static_csv'
     ):
-        st.warning("Wikipedia index fetch used a reduced fallback list. The universe may be smaller than the full S&P 500 + Nasdaq-100 set.")
+        st.warning("Using committed static universe because live Wikipedia fetch failed.")
+
+    if (
+        universe_breakdown.get('sp500_source') == 'emergency_fallback'
+        or universe_breakdown.get('nasdaq100_source') == 'emergency_fallback'
+    ):
+        st.warning("Using reduced emergency universe; coverage is incomplete.")
 
     if fetch_stats.get('stooq_recovered_count', 0) > 0:
         st.warning("Some symbols use Stooq daily close fallback. This is not Yahoo adjusted close.")
