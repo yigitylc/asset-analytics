@@ -153,6 +153,22 @@ def test_build_universe_uses_full_static_csvs_when_live_fetch_fails(monkeypatch,
     assert breakdown["final_unique"] == 496
 
 
+def test_static_universe_warning_names_each_fallback_and_its_error():
+    assert app.static_universe_warning(
+        {"sp500_source": "wikipedia", "nasdaq100_source": "wikipedia"}
+    ) is None
+
+    message = app.static_universe_warning({
+        "sp500_source": "wikipedia",
+        "sp500_error": "",
+        "nasdaq100_source": "static_csv",
+        "nasdaq100_error": "Wikipedia table did not contain enough Nasdaq-100 symbols.",
+    })
+    assert message.startswith("Using committed static universe because live Wikipedia fetch failed.")
+    assert "Nasdaq-100: Wikipedia table did not contain enough Nasdaq-100 symbols." in message
+    assert "S&P 500" not in message
+
+
 def test_dot_to_dash_mapping_still_works():
     assert app.sanitize_ticker("BRK.B") == "BRK-B"
     assert app.sanitize_ticker("PBR.A") == "PBR-A"

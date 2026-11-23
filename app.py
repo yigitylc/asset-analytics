@@ -235,7 +235,8 @@ def fetch_nasdaq100_constituents() -> Tuple[List[str], Dict[str, Any]]:
     """Fetch Nasdaq-100 constituents with source metadata."""
     live_error = ""
     try:
-        url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
+        # Members are on their own list page; the Nasdaq-100 article no longer has the table.
+        url = 'https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies'
         tables = _read_html_with_headers(url)
         for df in tables:
             for col in ['Ticker', 'Ticker symbol', 'Symbol']:
@@ -311,6 +312,17 @@ def build_universe_uncached() -> Tuple[List[str], Dict[str, Any]]:
 def build_universe() -> Tuple[List[str], Dict[str, Any]]:
     """Build complete ticker universe with Streamlit caching."""
     return build_universe_uncached()
+
+
+def static_universe_warning(breakdown: Dict[str, Any]) -> Optional[str]:
+    """Warning naming each constituent list that fell back to its committed CSV, with the live error."""
+    reasons = []
+    for key, label in (('sp500', 'S&P 500'), ('nasdaq100', 'Nasdaq-100')):
+        if breakdown.get(key + '_source') == 'static_csv':
+            reasons.append(f"{label}: {breakdown.get(key + '_error') or 'no reason recorded'}")
+    if not reasons:
+        return None
+    return "Using committed static universe because live Wikipedia fetch failed. " + " | ".join(reasons)
 
 
 
@@ -1005,11 +1017,9 @@ def main():
 
     available_tickers = list(cl_price_raw.columns)
 
-    if (
-        universe_breakdown.get('sp500_source') == 'static_csv'
-        or universe_breakdown.get('nasdaq100_source') == 'static_csv'
-    ):
-        st.warning("Using committed static universe because live Wikipedia fetch failed.")
+    static_warning = static_universe_warning(universe_breakdown)
+    if static_warning:
+        st.warning(static_warning)
 
     if (
         universe_breakdown.get('sp500_source') == 'emergency_fallback'
